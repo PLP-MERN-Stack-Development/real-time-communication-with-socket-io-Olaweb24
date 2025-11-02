@@ -1,12 +1,9 @@
-// socket.js - Socket.io client setup
+// socket.js - Enhanced Socket.io client setup with Task 5 infinite scroll support
+import { io } from "socket.io-client";
+import { useEffect, useState } from "react";
 
-import { io } from 'socket.io-client';
-import { useEffect, useState } from 'react';
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:5000";
 
-// Socket.io connection URL
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5000';
-
-// Create socket instance
 export const socket = io(SOCKET_URL, {
   autoConnect: false,
   reconnection: true,
@@ -14,136 +11,232 @@ export const socket = io(SOCKET_URL, {
   reconnectionDelay: 1000,
 });
 
-// Custom hook for using socket.io
 export const useSocket = () => {
   const [isConnected, setIsConnected] = useState(socket.connected);
-  const [lastMessage, setLastMessage] = useState(null);
   const [messages, setMessages] = useState([]);
   const [users, setUsers] = useState([]);
   const [typingUsers, setTypingUsers] = useState([]);
+  const [currentRoom, setCurrentRoom] = useState("global");
+  const [privateTo, setPrivateTo] = useState(null);
+  const [unreadCounts, setUnreadCounts] = useState({});
 
-  // Connect to socket server
+  // Simple toast fallback
+  const showToast = (text) => {
+    const div = document.createElement("div");
+    div.textContent = text;
+    Object.assign(div.style, {
+      position: "fixed",
+      bottom: "20px",
+      right: "20px",
+      background: "#333",
+      color: "white",
+      padding: "10px 16px",
+      borderRadius: "8px",
+      fontSize: "14px",
+      zIndex: 9999,
+      opacity: 0,
+      transition: "opacity 0.3s",
+    });
+    document.body.appendChild(div);
+    setTimeout(() => (div.style.opacity = 1), 50);
+    setTimeout(() => {
+      div.style.opacity = 0;
+      setTimeout(() => div.remove(), 300);
+    }, 4000);
+  };
+
   const connect = (username) => {
     socket.connect();
-    if (username) {
-      socket.emit('user_join', username);
-    }
+    if (username) socket.emit("user_join", username);
   };
 
-  // Disconnect from socket server
-  const disconnect = () => {
-    socket.disconnect();
-  };
+  const disconnect = () => socket.disconnect();
 
-  // Send a message
   const sendMessage = (message) => {
-    socket.emit('send_message', { message });
+    socket.emit("send_message", { message });
   };
 
-  // Send a private message
   const sendPrivateMessage = (to, message) => {
-    socket.emit('private_message', { to, message });
+    socket.emit("private_message", { to, message });
   };
 
-  // Set typing status
   const setTyping = (isTyping) => {
-    socket.emit('typing', isTyping);
+    socket.emit("typing", isTyping);
   };
 
-  // Socket event listeners
+  const joinRoom = (roomName) => {
+    socket.emit("join_room", roomName);
+    setCurrentRoom(roomName);
+    setPrivateTo(null);
+    setUnreadCounts((prev) => ({ ...prev, [roomName]: 0 }));
+  };
+
+  const selectPrivate = (user) => {
+    setPrivateTo(user);
+    setUnreadCounts((prev) => ({ ...prev, [user?.id]: 0 }));
+  };
+
+  const sendFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      socket.emit("send_file", {
+        fileData: reader.result,
+        fileName: file.name,
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const sendReaction = (messageId, reaction) => {
+    socket.emit("react_message", { messageId, reaction });
+  };
+
+  const markAsRead = (messageId) => {
+    socket.emit("read_message", messageId);
+  };
+
+  const playNotificationSound = () => {
+    const audio = new Audio("/notification.mp3");
+    audio.play().catch(() => {});
+  };
+
+  const showBrowserNotification = (title, body) => {
+    if (!("Notification" in window)) return;
+
+    if (Notification.permission === "granted") {
+      new Notification(title, { body });
+    } else if (Notification.permission !== "denied") {
+      Notification.requestPermission().then((perm) => {
+        if (perm === "granted") new Notification(title, { body });
+        else showToast(`${title}: ${body}`);
+      });
+    } else showToast(`${title}: ${body}`);
+  };
+
+  // --- NEW: load older messages ---
+  const loadOlderMessages = ({ room, privateToId, oldestMessageId }, callback) => {
+    socket.emit(
+      "load_older_messages",
+      { room, privateToId, oldestMessageId },
+      (olderMessages) => {
+        if (olderMessages && olderMessages.length > 0) {
+          setMessages((prev) => [...olderMessages, ...prev]);
+        }
+        if (callback) callback(olderMessages);
+      }
+    );
+  };
+
   useEffect(() => {
-    // Connection events
-    const onConnect = () => {
-      setIsConnected(true);
+    if ("Notification" in window && Notification.permission !== "granted") {
+      Notification.requestPermission().catch(() => {});
+    }
+
+    const handleConnect = () => setIsConnected(true);
+    const handleDisconnect = () => setIsConnected(false);
+
+    const handleReceiveMessage = (msg) => {
+      setMessages((prev) => [...prev, msg]);
+
+      const isCurrentRoom =
+        (!msg.isPrivate && msg.room === currentRoom) ||
+        (msg.isPrivate && privateTo?.id === msg.senderId);
+
+      playNotificationSound();
+
+      if (!isCurrentRoom) {
+        const key = msg.isPrivate ? msg.senderId : msg.room;
+        setUnreadCounts((prev) => ({ ...prev, [key]: (prev[key] || 0) + 1 }));
+
+        showBrowserNotification(
+          msg.isPrivate ? `Private message from ${msg.sender}` : `New message in #${msg.room}`,
+          typeof msg.message === "string" ? msg.message : JSON.stringify(msg.message)
+        );
+      }
     };
 
-    const onDisconnect = () => {
-      setIsConnected(false);
-    };
+    const handleRoomMessages = (msgs) => setMessages(msgs);
+    const handlePrivateMessage = (msg) => handleReceiveMessage(msg);
+    const handleUserList = (list) => setUsers(list);
 
-    // Message events
-    const onReceiveMessage = (message) => {
-      setLastMessage(message);
-      setMessages((prev) => [...prev, message]);
-    };
-
-    const onPrivateMessage = (message) => {
-      setLastMessage(message);
-      setMessages((prev) => [...prev, message]);
-    };
-
-    // User events
-    const onUserList = (userList) => {
-      setUsers(userList);
-    };
-
-    const onUserJoined = (user) => {
-      // You could add a system message here
+    const handleUserJoined = (user) => {
       setMessages((prev) => [
         ...prev,
-        {
-          id: Date.now(),
-          system: true,
-          message: `${user.username} joined the chat`,
-          timestamp: new Date().toISOString(),
-        },
+        { id: Date.now(), system: true, message: `${user.username} joined the chat`, timestamp: new Date().toISOString() },
       ]);
+      playNotificationSound();
+      showBrowserNotification("User joined", `${user.username} joined the chat`);
     };
 
-    const onUserLeft = (user) => {
-      // You could add a system message here
+    const handleUserLeft = (user) => {
       setMessages((prev) => [
         ...prev,
-        {
-          id: Date.now(),
-          system: true,
-          message: `${user.username} left the chat`,
-          timestamp: new Date().toISOString(),
-        },
+        { id: Date.now(), system: true, message: `${user.username} left the chat`, timestamp: new Date().toISOString() },
       ]);
+      playNotificationSound();
+      showBrowserNotification("User left", `${user.username} left the chat`);
     };
 
-    // Typing events
-    const onTypingUsers = (users) => {
-      setTypingUsers(users);
+    const handleTypingUsers = (list) => setTypingUsers(list);
+
+    const handleReaction = ({ messageId, reaction }) => {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, reactions: [...(m.reactions || []), { reaction }] } : m))
+      );
     };
 
-    // Register event listeners
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-    socket.on('receive_message', onReceiveMessage);
-    socket.on('private_message', onPrivateMessage);
-    socket.on('user_list', onUserList);
-    socket.on('user_joined', onUserJoined);
-    socket.on('user_left', onUserLeft);
-    socket.on('typing_users', onTypingUsers);
+    const handleReadReceipt = ({ messageId, readers }) => {
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, readers } : m)));
+    };
 
-    // Clean up event listeners
+    socket.on("connect", handleConnect);
+    socket.on("disconnect", handleDisconnect);
+    socket.on("receive_message", handleReceiveMessage);
+    socket.on("room_messages", handleRoomMessages);
+    socket.on("private_message", handlePrivateMessage);
+    socket.on("user_list", handleUserList);
+    socket.on("user_joined", handleUserJoined);
+    socket.on("user_left", handleUserLeft);
+    socket.on("typing_users", handleTypingUsers);
+    socket.on("message_reaction", handleReaction);
+    socket.on("message_read", handleReadReceipt);
+
     return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-      socket.off('receive_message', onReceiveMessage);
-      socket.off('private_message', onPrivateMessage);
-      socket.off('user_list', onUserList);
-      socket.off('user_joined', onUserJoined);
-      socket.off('user_left', onUserLeft);
-      socket.off('typing_users', onTypingUsers);
+      socket.off("connect", handleConnect);
+      socket.off("disconnect", handleDisconnect);
+      socket.off("receive_message", handleReceiveMessage);
+      socket.off("room_messages", handleRoomMessages);
+      socket.off("private_message", handlePrivateMessage);
+      socket.off("user_list", handleUserList);
+      socket.off("user_joined", handleUserJoined);
+      socket.off("user_left", handleUserLeft);
+      socket.off("typing_users", handleTypingUsers);
+      socket.off("message_reaction", handleReaction);
+      socket.off("message_read", handleReadReceipt);
     };
-  }, []);
+  }, [currentRoom, privateTo]);
 
   return {
     socket,
     isConnected,
-    lastMessage,
     messages,
     users,
     typingUsers,
+    currentRoom,
+    privateTo,
+    unreadCounts,
     connect,
     disconnect,
     sendMessage,
     sendPrivateMessage,
     setTyping,
+    joinRoom,
+    selectPrivate,
+    sendFile,
+    sendReaction,
+    markAsRead,
+    loadOlderMessages, // New method exposed
   };
 };
 
-export default socket; 
+export default socket;
